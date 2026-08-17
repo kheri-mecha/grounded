@@ -54,6 +54,7 @@ GROUNDED_DIR_DEFAULT = os.path.expanduser("~/.cache/grounded/data/")
 LOCKS_DIR_DEFAULT = os.path.expanduser("~/.cache/grounded/locks/")
 
 HAND_TAR_NAME_DEFAULT = "hand_v2_outputs.tar"
+GSI_DOWNLOADED_ARTIFACT_SCHEMA = "gsi.downloaded-artifact.v1"
 CLIPPED_HAND_SCHEMA_VERSION = "grounded.episode.hand_clip.v1alpha1"
 CLIPPED_POSE_TAR_NAME = "pose_frames.tar"
 CLIPPED_POSE_PREFIX = ("hand", "pose_interpolation", "params")
@@ -82,7 +83,7 @@ class HandPose:
 
     side: str  # "left" | "right"
     keypoints3d: np.ndarray  # (21, 3) float32, MANO-21 joints
-    vertices: np.ndarray  # (778, 3) float32, MANO mesh vertices
+    vertices: Optional[np.ndarray]  # (778, 3) float32 MANO mesh vertices, when published
     global_orient: np.ndarray  # (3, 3) float32, root rotation
     transl: np.ndarray  # (3,) float32, root translation (== wrist)
     hand_pose: np.ndarray  # (15, 3, 3) float32, articulated joint rotations
@@ -721,13 +722,14 @@ class HandEpisode(Dataset):
 
         with np.load(filepath, allow_pickle=True) as d:
             sides = [str(s) for s in d["sides"]]
+            vertices = d["vertices"] if "vertices" in d.files else None
             for row, side in enumerate(sides):
                 if side not in SIDES:
                     continue
                 pose = HandPose(
                     side=side,
                     keypoints3d=np.asarray(d["keypoints3d"][row], dtype=np.float32),
-                    vertices=np.asarray(d["vertices"][row], dtype=np.float32),
+                    vertices=(np.asarray(vertices[row], dtype=np.float32) if vertices is not None else None),
                     global_orient=np.asarray(d["global_orients"][row], dtype=np.float32),
                     transl=np.asarray(d["transls"][row], dtype=np.float32),
                     hand_pose=np.asarray(d["hand_poses"][row], dtype=np.float32),
@@ -845,6 +847,91 @@ class HandEpisode(Dataset):
         episode.run_id = str(getattr(hand_files[0], "run_id", "") or "")
         episode.job_id = ""
         episode.download_root = str(download_root)
+        return episode
+
+    @classmethod
+    def from_gsi_artifact(
+        cls,
+        artifact: Union[str, os.PathLike],
+        *,
+        active_cameras: Optional[List[str]] = None,
+        valid_only: bool = False,
+    ) -> "HandEpisode":
+        """Open a verified Hand artifact downloaded by the GSI API CLI.
+
+        ``artifact`` may be the artifact directory or its ``artifact.json`` sidecar.
+        The sidecar and canonical archive identity are validated before extraction.
+        """
+
+        supplied_path = Path(artifact).expanduser().resolve()
+        if supplied_path.is_dir():
+            artifact_root = supplied_path
+            manifest_path = artifact_root / "artifact.json"
+        else:
+            manifest_path = supplied_path
+            artifact_root = manifest_path.parent
+        if manifest_path.name != "artifact.json" or not manifest_path.is_file():
+            raise FileNotFoundError(f"Missing GSI artifact manifest: {manifest_path}")
+        try:
+            document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid GSI artifact manifest: {manifest_path}") from exc
+        if not isinstance(document, dict):
+            raise ValueError("GSI artifact manifest must contain a JSON object")
+        if document.get("schema_version") != GSI_DOWNLOADED_ARTIFACT_SCHEMA:
+            raise ValueError("Unsupported GSI downloaded-artifact schema")
+        if document.get("kind") != "HAND_OUTPUT_BUNDLE" or str(document.get("service", "")).upper() != "HAND":
+            raise ValueError("GSI artifact is not a Hand output bundle")
+        if document.get("filename") != HAND_TAR_NAME_DEFAULT:
+            raise ValueError(f"GSI Hand artifact must be named {HAND_TAR_NAME_DEFAULT}")
+        asset_id = str(document.get("asset_id") or "")
+        artifact_id = str(document.get("artifact_id") or "")
+        if not asset_id or not artifact_id:
+            raise ValueError("GSI Hand artifact is missing asset or artifact identity")
+        try:
+            segment = int(document["segment_index"])
+            expected_size = int(document["size_bytes"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("GSI Hand artifact has invalid segment or size metadata") from exc
+        if segment < 0 or expected_size < 0:
+            raise ValueError("GSI Hand artifact has invalid segment or size metadata")
+        expected_sha256 = str(document.get("sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise ValueError("GSI Hand artifact has an invalid SHA-256")
+
+        archive_path = (artifact_root / HAND_TAR_NAME_DEFAULT).resolve()
+        if archive_path.parent != artifact_root or not archive_path.is_file():
+            raise FileNotFoundError(f"Missing GSI Hand archive: {archive_path}")
+        if archive_path.stat().st_size != expected_size or _sha256_path(archive_path) != expected_sha256:
+            raise ValueError("GSI Hand archive identity does not match artifact.json")
+
+        from grounded.processing import AssetDownload, DownloadedAssetFile
+
+        downloaded_file = DownloadedAssetFile(
+            asset_id=asset_id,
+            lane="hand",
+            run_id="",
+            source_uri="",
+            local_path=str(archive_path),
+            size_bytes=expected_size,
+            sha256=expected_sha256,
+            size_verified=True,
+            sha256_verified=True,
+        )
+        download = AssetDownload(
+            asset_id=asset_id,
+            root_dir=str(artifact_root),
+            files=(downloaded_file,),
+        )
+        episode = cls.from_asset_download(
+            download,
+            segment=segment,
+            active_cameras=active_cameras,
+            valid_only=valid_only,
+        )
+        episode.artifact_id = artifact_id
+        episode.artifact_schema_version = str(document.get("artifact_schema_version") or "")
+        episode.gsi_artifact_dir = str(artifact_root)
         return episode
 
     def project_to_camera(self, points_3d: np.ndarray, camera: str) -> np.ndarray:
